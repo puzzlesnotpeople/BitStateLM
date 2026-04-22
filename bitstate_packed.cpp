@@ -388,10 +388,28 @@ struct LinearLayer {
         for (int i = 0; i < in_features; i++) x_ln[i] = x[i];
         apply_ln(x_ln.data(), in_features);
         
+        // INT8 activation quantization (matches Python BitLinear._infer_forward)
+        // clip_val = abs_mean * 2.5, a_scale = clip_val / 127
+        float abs_sum = 0.0f;
+        for (int i = 0; i < in_features; i++) abs_sum += std::fabs(x_ln[i]);
+        float abs_mean = abs_sum / in_features;
+        float clip_val = std::max(abs_mean * 2.5f, 1e-8f);
+        float a_scale = clip_val / 127.0f;
+        
+        // Quantize activations to INT8 (store as float for ternary matmul)
+        for (int i = 0; i < in_features; i++) {
+            float scaled = x_ln[i] / a_scale;
+            float clipped = std::max(-127.0f, std::min(127.0f, scaled));
+            x_ln[i] = std::round(clipped);  // INT8 value as float
+        }
+        
+        // Ternary matmul: sum = Σ w_ternary * x_i8
+        // Dequantize: y = sum * w_scale * a_scale
+        float combined_scale = scale * a_scale;
         if (is_packed) {
-            ternary_linear_packed(x_ln.data(), weight_packed.ptr(), scale, y, out_features, in_features);
+            ternary_linear_packed(x_ln.data(), weight_packed.ptr(), combined_scale, y, out_features, in_features);
         } else {
-            ternary_linear_unpacked(x_ln.data(), weight_i8.ptr(), scale, y, out_features, in_features);
+            ternary_linear_unpacked(x_ln.data(), weight_i8.ptr(), combined_scale, y, out_features, in_features);
         }
     }
 };
@@ -526,7 +544,6 @@ struct TMBlock {
         v_proj.forward(mixed_v.data(), v.data());
         g_proj.forward(mixed_g.data(), g.data());
         
-        
         // 4. Activations
         // NOTE: r, k, v have NO activations before WKV in Python!
         // log_decay -> w = exp(-exp(log_decay)) happens INSIDE WKV
@@ -546,33 +563,28 @@ struct TMBlock {
             const float* rh = r.data() + base;
             const float* kh = k.data() + base;
             const float* vh = v.data() + base;
-            const float* gh = g.data() + base;
             const float* lw = log_decay.ptr() + h * head_size;
             const float* uh = time_first.ptr() + h * head_size;
             float* oh = wkv_out.data() + base;
             
-            for (int s1 = 0; s1 < head_size; s1++) {
-                // Decay factor: w = exp(-exp(log_decay))
-                float w_s1 = std::exp(-std::exp(lw[s1]));
-                float u_s1 = std::exp(uh[s1]);  // time_first bonus
-                
-                float y_s1 = 0.0f;
-                
-                for (int s2 = 0; s2 < head_size; s2++) {
-                    // Outer product: kv = k[s1] * v[s2]
-                    float kv = kh[s1] * vh[s2];
-                    
-                    // Current state value
-                    float& state_s1s2 = state_h[s1 * head_size + s2];
-                    
-                    // WKV output: r · (state + u * kv)
-                    y_s1 += rh[s2] * (state_s1s2 + u_s1 * kv);
-                    
-                    // Update state: new_state = w * state + kv
-                    state_s1s2 = w_s1 * state_s1s2 + kv;
+            // Precompute w and u values
+            std::vector<float> w_val(head_size), u_val(head_size);
+            for (int i = 0; i < head_size; i++) {
+                w_val[i] = std::exp(-std::exp(lw[i]));
+                u_val[i] = std::exp(uh[i]);
+            }
+            
+            // Correct WKV: y[j] = Σ_i r[i] * (state[i,j] + u[i]*k[i]*v[j])
+            // State update: state[i,j] = w[i]*state[i,j] + k[i]*v[j]
+            for (int j = 0; j < head_size; j++) {
+                float y_j = 0.0f;
+                for (int i = 0; i < head_size; i++) {
+                    float kv = kh[i] * vh[j];  // k[i] * v[j]
+                    float& s_ij = state_h[i * head_size + j];
+                    y_j += rh[i] * (s_ij + u_val[i] * kv);
+                    s_ij = w_val[i] * s_ij + kv;
                 }
-                
-                oh[s1] = y_s1 * gh[s1];  // multiply by gate
+                oh[j] = y_j;  // gate applied AFTER GroupNorm
             }
         }
         
@@ -585,7 +597,12 @@ struct TMBlock {
             std::memcpy(gn_out.data(), wkv_out.data(), n_embd * sizeof(float));
         }
         
-        // 7. Output projection — return delta only, residual added in model forward
+        // 7. Apply gate AFTER GroupNorm (matches Python: out = o_proj(gn(y) * g))
+        for (int i = 0; i < n_embd; i++) {
+            gn_out[i] *= g[i];
+        }
+        
+        // 8. Output projection — return delta only, residual added in model forward
         o_proj.forward(gn_out.data(), out);
         
     }
@@ -629,18 +646,18 @@ struct CMBlock {
             k[i] = relu_k * relu_k;
         }
         
-        // r-gate: sigmoid(r) * v(k)
+        // Output projection FIRST (matches Python: rgate * v_proj(k_act))
+        v_proj.forward(k.data(), out);
+        
+        // r-gate: sigmoid(r) applied AFTER v_proj
         for (int i = 0; i < n_embd; i++) {
             r[i] = 1.0f / (1.0f + std::exp(-r[i]));  // sigmoid
         }
         
-        // Apply gate: k[i] *= r[i % n_embd]
-        for (int i = 0; i < expanded; i++) {
-            k[i] *= r[i % n_embd];
+        // Apply gate to output: out[i] *= sigmoid(r[i])
+        for (int i = 0; i < n_embd; i++) {
+            out[i] *= r[i];
         }
-        
-        // Output projection — return delta only, residual added in model forward
-        v_proj.forward(k.data(), out);
         
     }
 };
@@ -800,9 +817,6 @@ struct BitStateLMModel {
         }
         
         for (int layer = 0; layer < cfg.n_layer; layer++) {
-            // Save raw x for TM time-mixing (before ln1)
-            std::vector<float> x_raw = x;
-            
             // Apply ln1 for TM input
             std::vector<float> x_ln1(cfg.n_embd);
             tm_blocks[layer].ln1.forward(x.data(), x_ln1.data(), cfg.n_embd);
@@ -812,14 +826,11 @@ struct BitStateLMModel {
             tm_blocks[layer].forward(x_ln1.data(), tm_prev_x[layer].data(), tm_out.data(), 
                                      wkv_states[layer], 
                                      cfg.n_embd, cfg.n_head, cfg.head_size);
-            // Update TM prev_x (raw x before ln1)
-            tm_prev_x[layer] = x_raw;
+            // Update TM prev_x (normalized x = ln1(x), matches Python state[0])
+            tm_prev_x[layer] = x_ln1;
             
             // Residual: x = x + tm_out
             for (int i = 0; i < cfg.n_embd; i++) x[i] += tm_out[i];
-            
-            // Save raw x for CM time-mixing (before ln2)
-            x_raw = x;
             
             // Apply ln2 for CM input
             std::vector<float> x_ln2(cfg.n_embd);
@@ -829,8 +840,8 @@ struct BitStateLMModel {
             // CM with time-mixing: pass prev_x (raw) and current x_ln2
             cm_blocks[layer].forward(x_ln2.data(), cm_prev_x[layer].data(), cm_out.data(), 
                                      cfg.n_embd);
-            // Update CM prev_x (raw x before ln2)
-            cm_prev_x[layer] = x_raw;
+            // Update CM prev_x (normalized x = ln2(x), matches Python state)
+            cm_prev_x[layer] = x_ln2;
             
             // Residual: x = x + cm_out
             for (int i = 0; i < cfg.n_embd; i++) x[i] += cm_out[i];

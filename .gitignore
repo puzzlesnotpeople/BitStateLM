@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pt
+data/
+checkpoints/
+bitstate
+bitstate.exe
+bitstate_debug
+bitstate_test
+*.o
+mingw.zip

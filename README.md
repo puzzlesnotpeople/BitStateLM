@@ -4,8 +4,8 @@ A small language model built around RWKV-style recurrent attention and BitNet 1.
 
 ## 🚀 Try it now
 
-- **🌐 [Live WASM Demo](https://yourusername.github.io/bitstatelm/)** — Run the model directly in your browser (zero install)
-- **📥 [Download Pre-trained Weights](https://github.com/yourusername/bitstatelm/releases)** — `bitstate.bin` (**8.7 MB**) — true 1.58-bit compression
+- **🌐 [Live WASM Demo](https://puzzlesnotpeople.github.io/BitStateLM/)** — Run the model directly in your browser (zero install)
+- **📥 [Download Pre-trained Weights](https://github.com/puzzlesnotpeople/BitStateLM/releases)** — `bitstate.bin` (**8.7 MB**) — true 1.58-bit compression
 
 ## 📦 Quick Download & Run
 
@@ -13,7 +13,7 @@ Download the pre-built binary weights and run inference immediately:
 
 ```bash
 # Download the model (8.7 MB — 2-bit packed weights + INT8 embeddings)
-curl -L -o bitstate.bin https://github.com/yourusername/bitstatelm/releases/download/v1.0/bitstate.bin
+curl -L -o bitstate.bin https://github.com/puzzlesnotpeople/BitStateLM/releases/download/v1.0/bitstate.bin
 
 # Compile the C++ engine
 g++ -O3 -std=c++17 -o bitstate bitstate_packed.cpp
@@ -24,7 +24,7 @@ g++ -O3 -std=c++17 -o bitstate bitstate_packed.cpp
 
 Or use wget:
 ```bash
-wget https://github.com/yourusername/bitstatelm/releases/download/v1.0/bitstate.bin
+wget https://github.com/puzzlesnotpeople/BitStateLM/releases/download/v1.0/bitstate.bin
 ```
 
 ## Architecture

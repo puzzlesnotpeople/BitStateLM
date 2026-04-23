@@ -18,6 +18,7 @@
 #include <cmath>
 #include <random>
 #include <algorithm>
+#include <unordered_map>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -865,17 +866,38 @@ struct BitStateLMModel {
         }
     }
     
-    int sample(const float* logits, float temperature, int top_k) {
+    // Apply repetition penalty to logits (before softmax)
+    void apply_repetition_penalty(float* logits, const std::unordered_map<int, int>& seen_tokens, 
+                                   float penalty = 1.1f) {
+        for (const auto& [tok_id, count] : seen_tokens) {
+            if (tok_id >= 0 && tok_id < cfg.vocab_size) {
+                float power = std::min(count, 3);  // cap at 3 like Python
+                logits[tok_id] /= std::pow(penalty, power);
+            }
+        }
+    }
+    
+    int sample(const float* logits, float temperature, int top_k, 
+               const std::unordered_map<int, int>& seen_tokens = {}) {
+        // Work on a copy since we might apply penalties
+        std::vector<float> mod_logits(cfg.vocab_size);
+        for (int i = 0; i < cfg.vocab_size; i++) mod_logits[i] = logits[i];
+        
+        // Apply repetition penalty before temperature
+        if (!seen_tokens.empty()) {
+            apply_repetition_penalty(mod_logits.data(), seen_tokens, 1.1f);
+        }
+        
         std::vector<float> probs(cfg.vocab_size);
         
-        float max_logit = logits[0];
+        float max_logit = mod_logits[0];
         for (int i = 1; i < cfg.vocab_size; i++) {
-            if (logits[i] > max_logit) max_logit = logits[i];
+            if (mod_logits[i] > max_logit) max_logit = mod_logits[i];
         }
         
         float sum = 0.0f;
         for (int i = 0; i < cfg.vocab_size; i++) {
-            probs[i] = std::exp((logits[i] - max_logit) / temperature);
+            probs[i] = std::exp((mod_logits[i] - max_logit) / temperature);
             sum += probs[i];
         }
         
@@ -910,6 +932,7 @@ struct BitStateLMModel {
     std::vector<int> generate(const std::vector<int>& prompt, int max_new,
                                float temperature = 1.0f) {
         std::vector<float> logits(cfg.vocab_size);
+        std::unordered_map<int, int> seen_tokens;  // Track token frequencies for repetition penalty
 
         // Feed all prompt tokens through model to build up recurrent state
         std::cout << "Processing prompt (" << prompt.size() << " tokens)...\n";
@@ -930,8 +953,10 @@ struct BitStateLMModel {
 
         auto t0 = std::chrono::high_resolution_clock::now();
         for (int i = 0; i < max_new; i++) {
-            int next_token = sample(logits.data(), temperature, 50);
+            int next_token = sample(logits.data(), temperature, 50, seen_tokens);
             tokens.push_back(next_token);
+            // Update repetition tracking
+            seen_tokens[next_token]++;
             forward(next_token, logits.data());
 
             if ((i + 1) % 10 == 0) {

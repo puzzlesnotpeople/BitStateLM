@@ -261,7 +261,11 @@ class Trainer:
         # either disable compile_model or switch to dtype='bfloat16'.
         assert train_cfg.dtype in ('float16', 'bfloat16', 'float32'), \
             f"Unknown dtype: {train_cfg.dtype}"
-        self.scaler = GradScaler(enabled=(train_cfg.dtype == 'float16'))
+        # Fix for PyTorch 2.5+: use device-specific GradScaler
+        if train_cfg.dtype == 'float16':
+            self.scaler = GradScaler(device=train_cfg.device.split(':')[0])
+        else:
+            self.scaler = GradScaler(enabled=False)  # Disabled for float32/bfloat16
         self.ptdtype = {'bfloat16': torch.bfloat16, 'float16': torch.float16, 'float32': torch.float32}[train_cfg.dtype]
 
         # Chunked dataset + DataLoader
@@ -273,6 +277,9 @@ class Trainer:
 
         self.step          = 0
         self.best_val_loss = float('inf')
+        
+        # Try to resume from checkpoint
+        self._load_checkpoint()
 
         # Log actual training volume
         total_tokens = train_cfg.batch_size * train_cfg.seq_len * train_cfg.max_steps
@@ -390,13 +397,31 @@ class Trainer:
                     self._save('best')
             if self.step % self.tcfg.save_interval == 0:
                 self._save(f'step_{self.step}')
+            # Always keep latest checkpoint for resume
+            if self.step % 1000 == 0:
+                self._save('latest')
         self._save('final')
 
     def _save(self, tag):
+        os.makedirs(self.tcfg.out_dir, exist_ok=True)
         path = os.path.join(self.tcfg.out_dir, f'bitstate_{tag}.pt')
         torch.save({'config': self.mcfg, 'step': self.step,
                     'model': self.model.state_dict(), 'opt': self.opt.state_dict()}, path)
         print(f"  ✓ {path}")
+    
+    def _load_checkpoint(self):
+        """Resume from latest checkpoint if exists"""
+        latest_path = os.path.join(self.tcfg.out_dir, 'bitstate_latest.pt')
+        if os.path.exists(latest_path):
+            print(f"\n[RESUME] Found checkpoint: {latest_path}")
+            ckpt = torch.load(latest_path, map_location=self.tcfg.device)
+            self.model.load_state_dict(ckpt['model'])
+            self.opt.load_state_dict(ckpt['opt'])
+            self.step = ckpt['step']
+            self.sched.last_epoch = self.step  # Adjust scheduler
+            print(f"[RESUME] Resumed from step {self.step}")
+            return True
+        return False
 
 
 # --- Main ---
@@ -451,7 +476,7 @@ if __name__ == '__main__':
             batch_size    = 2,
             grad_accum    = 1,
             seq_len       = 128,
-            max_steps     = 10_000,
+            max_steps     = 20_000,  # ~3-4 hours on CPU, good for demo
             lr            = 3e-4,
             num_workers   = 0,  # CPU: 0 workers for compatibility
             dtype         = 'float32',  # CPU: bfloat16 not always available

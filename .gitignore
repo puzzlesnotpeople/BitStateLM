@@ -1,6 +1,7 @@
-__pycache__/
-*.pyc
+*.bin
 *.pt
+*.pyc
+__pycache__/
 data/
 checkpoints/
 bitstate
